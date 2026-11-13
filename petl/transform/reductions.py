@@ -4,6 +4,7 @@ from __future__ import absolute_import, print_function, division
 import itertools
 import operator
 from collections import OrderedDict
+from decimal import Decimal
 from petl.compat import next, string_types, reduce, text_type
 
 
@@ -14,6 +15,74 @@ from petl.util.counting import nrows
 from petl.transform.sorts import sort, mergesort
 from petl.transform.basics import cut
 from petl.transform.dedup import distinct
+
+
+def _to_decimal(value):
+    # float values are converted via their string representation, per the
+    # reconciliation requirement Decimal(str(x))
+    return Decimal(text_type(value))
+
+
+def sum(values):
+    """Sum a sequence of numeric values, skipping ``None``.
+
+    If the sequence contains at least one :class:`decimal.Decimal`, all
+    numeric values are converted to Decimal (floats via ``Decimal(str(x))``)
+    and the result is a Decimal. Otherwise the result type follows the
+    built-in behaviour (ints sum to int, a float in the mix gives float).
+    A sequence containing only ``None`` (or an empty sequence) returns
+    ``None``.
+
+    Intended for use with :func:`petl.transform.reductions.aggregate`, e.g.::
+
+        >>> import petl as etl
+        >>> table = [['k', 'amount'], ['a', 1], ['a', None], ['a', 2.5]]
+        >>> etl.aggregate(table, 'k', etl.sum, 'amount')
+        +-----+-------+
+        | k   | value |
+        +=====+=======+
+        | 'a' | 3.5   |
+        +-----+-------+
+
+    """
+
+    # the input may be a one-shot iterator, so materialise it once
+    numeric = [v for v in values if v is not None]
+    if not numeric:
+        return None
+    if any(isinstance(v, Decimal) for v in numeric):
+        total = Decimal(0)
+        for value in numeric:
+            total += _to_decimal(value)
+        return total
+    # no Decimal present: keep the built-in sum type behaviour
+    total = 0
+    for value in numeric:
+        total += value
+    return total
+
+
+def mean(values):
+    """Mean of a sequence of numeric values, skipping ``None``.
+
+    If the sequence contains at least one :class:`decimal.Decimal`, all
+    numeric values are converted to Decimal (floats via ``Decimal(str(x))``)
+    and the result is a Decimal. Otherwise the mean is computed in float,
+    matching the usual expectation for int/float columns. A sequence
+    containing only ``None`` (or an empty sequence) returns ``None``.
+
+    Intended for use with :func:`petl.transform.reductions.aggregate`.
+    """
+
+    numeric = [v for v in values if v is not None]
+    if not numeric:
+        return None
+    if any(isinstance(v, Decimal) for v in numeric):
+        total = Decimal(0)
+        for value in numeric:
+            total += _to_decimal(value)
+        return total / Decimal(len(numeric))
+    return float(sum(numeric)) / len(numeric)
 
 
 def rowreduce(table, key, reducer, header=None, presorted=False,

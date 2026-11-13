@@ -132,6 +132,40 @@ class Uncloseable(object):
         pass
 
 
+class OpenFileSource(object):
+    """Adapter around a file object that the caller has already opened.
+
+    Only text-mode streams are supported for writing: the stream is handed
+    straight to the CSV writer without re-opening or re-encoding, and it is
+    not closed by petl. Binary streams are rejected because the CSV writer
+    requires a text interface.
+    """
+
+    def __init__(self, fileobj):
+        self.fileobj = fileobj
+
+    @staticmethod
+    def _is_binary(fileobj):
+        # io.RawIOBase and io.BufferedIOBase streams are binary; text
+        # streams (TextIOWrapper, StringIO) derive from io.TextIOBase
+        if isinstance(fileobj, (io.RawIOBase, io.BufferedIOBase)):
+            return True
+        mode = getattr(fileobj, 'mode', None)
+        if isinstance(mode, str) and 'b' in mode:
+            return True
+        return False
+
+    @contextmanager
+    def open(self, mode='r'):
+        if 'b' in mode or self._is_binary(self.fileobj):
+            raise ArgumentError(
+                'an already-open file object can only be used as a text '
+                'source; open the file in text mode or pass a file path '
+                'instead')
+        # do not close the caller's file
+        yield Uncloseable(self.fileobj)
+
+
 def _get_stdout_binary():
     try:
         return sys.stdout.buffer
@@ -465,11 +499,14 @@ def _resolve_source_from_arg(source, handlers):
             assert '://' not in source, _invalid_source_msg % source
             return FileSource(source)
         return handler(source)
-    else:
-        assert (hasattr(source, 'open')
-                and callable(getattr(source, 'open'))), \
-            _invalid_source_msg % source
+    elif hasattr(source, 'open') and callable(getattr(source, 'open')):
         return source
+    elif hasattr(source, 'read') or hasattr(source, 'write'):
+        # an already-open file object (or file-like object such as
+        # io.StringIO); adapt it instead of rejecting it
+        return OpenFileSource(source)
+    else:
+        assert False, _invalid_source_msg % source
 
 
 def read_source_from_arg(source):

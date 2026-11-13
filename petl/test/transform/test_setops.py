@@ -125,6 +125,9 @@ def _test_complement_none(complement_impl):
     ta = [['a'], [now], [None]]
     tb = [['a'], [None], [None]]
 
+    # the None row is present in both tables so it cancels out; the
+    # remaining row is the datetime (nulls sort last, so it follows any
+    # non-null remainder)
     expectation = (('a',), (now,))
     result = complement_impl(ta, tb)
     ieq(expectation, result)

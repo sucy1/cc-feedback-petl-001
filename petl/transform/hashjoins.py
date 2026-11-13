@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import operator
 
 from petl.compat import next, text_type
+from petl.comparison import is_null_key
 from petl.transform.basics import stack
 from petl.transform.joins import keys_from_args, _nonkey_indices
 from petl.util.base import Table, asindices, iterpeek, rowgetter
@@ -10,7 +11,7 @@ from petl.util.lookups import lookup, lookupone
 
 
 def hashjoin(left, right, key=None, lkey=None, rkey=None, cache=True,
-             lprefix=None, rprefix=None, missing=None):
+             lprefix=None, rprefix=None, missing=None, match_nulls=False):
     """Alternative implementation of :func:`petl.transform.joins.join`, where
     the join is executed by constructing an in-memory lookup for the right
     hand table, then iterating over rows from the left hand table.
@@ -33,16 +34,17 @@ def hashjoin(left, right, key=None, lkey=None, rkey=None, cache=True,
     
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return HashJoinView(left, right, lkey=lkey, rkey=rkey, cache=cache,
-                        lprefix=lprefix, rprefix=rprefix, missing=missing)
+                        lprefix=lprefix, rprefix=rprefix, missing=missing,
+                        match_nulls=match_nulls)
 
 
 Table.hashjoin = hashjoin
 
 
 class HashJoinView(Table):
-    
+
     def __init__(self, left, right, lkey, rkey, cache=True, lprefix=None,
-                 rprefix=None, missing=None):
+                 rprefix=None, missing=None, match_nulls=False):
         self.left = stack(left, missing=missing)
         self.right = stack(right, missing=missing)
         self.lkey = lkey
@@ -51,15 +53,18 @@ class HashJoinView(Table):
         self.rlookup = None
         self.lprefix = lprefix
         self.rprefix = rprefix
-        
+        self.match_nulls = match_nulls
+
     def __iter__(self):
         if not self._cache or self.rlookup is None:
             self.rlookup = lookup(self.right, self.rkey)
         return iterhashjoin(self.left, self.right, self.lkey, self.rkey,
-                            self.rlookup, self.lprefix, self.rprefix)
-    
+                            self.rlookup, self.lprefix, self.rprefix,
+                            match_nulls=self.match_nulls)
 
-def iterhashjoin(left, right, lkey, rkey, rlookup, lprefix, rprefix):
+
+def iterhashjoin(left, right, lkey, rkey, rlookup, lprefix, rprefix,
+                 match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -102,14 +107,17 @@ def iterhashjoin(left, right, lkey, rkey, rlookup, lprefix, rprefix):
 
     for lrow in lit:
         k = lgetk(lrow)
+        if not match_nulls and is_null_key(k):
+            # null keys never participate in matching
+            continue
         if k in rlookup:
             rrows = rlookup[k]
             for outrow in joinrows(lrow, rrows):
                 yield outrow
-        
-        
+
+
 def hashleftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
-                 cache=True, lprefix=None, rprefix=None):
+                 cache=True, lprefix=None, rprefix=None, match_nulls=False):
     """Alternative implementation of :func:`petl.transform.joins.leftjoin`,
     where the join is executed by constructing an in-memory lookup for the
     right hand table, then iterating over rows from the left hand table.
@@ -131,16 +139,17 @@ def hashleftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
 
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return HashLeftJoinView(left, right, lkey, rkey, missing=missing,
-                            cache=cache, lprefix=lprefix, rprefix=rprefix)
+                            cache=cache, lprefix=lprefix, rprefix=rprefix,
+                            match_nulls=match_nulls)
 
 
 Table.hashleftjoin = hashleftjoin
 
 
 class HashLeftJoinView(Table):
-    
+
     def __init__(self, left, right, lkey, rkey, missing=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, match_nulls=False):
         self.left = stack(left, missing=missing)
         self.right = stack(right, missing=missing)
         self.lkey = lkey
@@ -150,17 +159,18 @@ class HashLeftJoinView(Table):
         self.rlookup = None
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.match_nulls = match_nulls
 
     def __iter__(self):
         if not self._cache or self.rlookup is None:
             self.rlookup = lookup(self.right, self.rkey)
         return iterhashleftjoin(self.left, self.right, self.lkey, self.rkey,
                                 self.missing, self.rlookup, self.lprefix,
-                                self.rprefix)
-    
+                                self.rprefix, match_nulls=self.match_nulls)
+
 
 def iterhashleftjoin(left, right, lkey, rkey, missing, rlookup, lprefix,
-                     rprefix):
+                     rprefix, match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -203,7 +213,13 @@ def iterhashleftjoin(left, right, lkey, rkey, missing, rlookup, lprefix,
 
     for lrow in lit:
         k = lgetk(lrow)
-        if k in rlookup:
+        if not match_nulls and is_null_key(k):
+            # null keys never match; keep the left row with missing right
+            # values, as for any other unmatched row in a left join
+            outrow = list(lrow)
+            outrow.extend([missing] * len(rvind))
+            yield tuple(outrow)
+        elif k in rlookup:
             rrows = rlookup[k]
             for outrow in joinrows(lrow, rrows):
                 yield outrow
@@ -215,7 +231,7 @@ def iterhashleftjoin(left, right, lkey, rkey, missing, rlookup, lprefix,
         
         
 def hashrightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
-                  cache=True, lprefix=None, rprefix=None):
+                  cache=True, lprefix=None, rprefix=None, match_nulls=False):
     """Alternative implementation of :func:`petl.transform.joins.rightjoin`,
     where the join is executed by constructing an in-memory lookup for the
     left hand table, then iterating over rows from the right hand table.
@@ -237,16 +253,17 @@ def hashrightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
 
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return HashRightJoinView(left, right, lkey, rkey, missing=missing,
-                             cache=cache, lprefix=lprefix, rprefix=rprefix)
+                             cache=cache, lprefix=lprefix, rprefix=rprefix,
+                             match_nulls=match_nulls)
 
 
 Table.hashrightjoin = hashrightjoin
 
 
 class HashRightJoinView(Table):
-    
+
     def __init__(self, left, right, lkey, rkey, missing=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, match_nulls=False):
         self.left = stack(left, missing=missing)
         self.right = stack(right, missing=missing)
         self.lkey = lkey
@@ -256,17 +273,18 @@ class HashRightJoinView(Table):
         self.llookup = None
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.match_nulls = match_nulls
 
     def __iter__(self):
         if not self._cache or self.llookup is None:
             self.llookup = lookup(self.left, self.lkey)
         return iterhashrightjoin(self.left, self.right, self.lkey, self.rkey,
                                  self.missing, self.llookup, self.lprefix,
-                                 self.rprefix)
-    
+                                 self.rprefix, match_nulls=self.match_nulls)
+
 
 def iterhashrightjoin(left, right, lkey, rkey, missing, llookup, lprefix,
-                      rprefix):
+                      rprefix, match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -310,7 +328,17 @@ def iterhashrightjoin(left, right, lkey, rkey, missing, llookup, lprefix,
 
     for rrow in rit:
         k = rgetk(rrow)
-        if k in llookup:
+        if not match_nulls and is_null_key(k):
+            # null keys never match; keep the right row with missing left
+            # values, as for any other unmatched row in a right join
+            outrow = [missing] * len(lhdr)
+            # set key values
+            for li, ri in zip(lkind, rkind):
+                outrow[li] = rrow[ri]
+            # extend with non-key values from the right row
+            outrow.extend(rgetv(rrow))
+            yield tuple(outrow)
+        elif k in llookup:
             lrows = llookup[k]
             for outrow in joinrows(rrow, lrows):
                 yield outrow
@@ -320,45 +348,49 @@ def iterhashrightjoin(left, right, lkey, rkey, missing, llookup, lprefix,
             # set key values
             for li, ri in zip(lkind, rkind):
                 outrow[li] = rrow[ri]
-            # extend with non-key values from the right row  
+            # extend with non-key values from the right row
             outrow.extend(rgetv(rrow))
             yield tuple(outrow)
         
         
-def hashantijoin(left, right, key=None, lkey=None, rkey=None):
+def hashantijoin(left, right, key=None, lkey=None, rkey=None,
+                 match_nulls=False):
     """Alternative implementation of :func:`petl.transform.joins.antijoin`,
     where the join is executed by constructing an in-memory set for all keys
     found in the right hand table, then iterating over rows from the left
     hand table.
-    
+
     May be faster and/or more resource efficient where the right table is small
     and the left table is large.
-    
+
     Left and right tables with different key fields can be handled via the
     `lkey` and `rkey` arguments.
 
     """
-    
+
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
-    return HashAntiJoinView(left, right, lkey, rkey)
+    return HashAntiJoinView(left, right, lkey, rkey,
+                            match_nulls=match_nulls)
 
 
 Table.hashantijoin = hashantijoin
 
 
 class HashAntiJoinView(Table):
-    
-    def __init__(self, left, right, lkey, rkey):
+
+    def __init__(self, left, right, lkey, rkey, match_nulls=False):
         self.left = left
         self.right = right
         self.lkey = lkey
         self.rkey = rkey
+        self.match_nulls = match_nulls
 
     def __iter__(self):
-        return iterhashantijoin(self.left, self.right, self.lkey, self.rkey)
-    
-    
-def iterhashantijoin(left, right, lkey, rkey):
+        return iterhashantijoin(self.left, self.right, self.lkey, self.rkey,
+                                match_nulls=self.match_nulls)
+
+
+def iterhashantijoin(left, right, lkey, rkey, match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -369,19 +401,25 @@ def iterhashantijoin(left, right, lkey, rkey):
     # determine indices of the key fields in left and right tables
     lkind = asindices(lhdr, lkey)
     rkind = asindices(rhdr, rkey)
-    
+
     # construct functions to extract key values from both tables
     lgetk = operator.itemgetter(*lkind)
     rgetk = operator.itemgetter(*rkind)
-    
+
     rkeys = set()
     for rrow in rit:
         rk = rgetk(rrow)
+        if not match_nulls and is_null_key(rk):
+            # null keys never participate in matching
+            continue
         rkeys.add(rk)
-        
+
     for lrow in lit:
         lk = lgetk(lrow)
-        if lk not in rkeys:
+        if not match_nulls and is_null_key(lk):
+            # null keys never match, so the left row is a difference
+            yield tuple(lrow)
+        elif lk not in rkeys:
             yield tuple(lrow)
 
 

@@ -199,10 +199,10 @@ def test_distinct():
 
     result = distinct(table)
     expect = (('foo', 'bar', 'baz'),
-              (None, None, None),
               ('A', 1, 2),
               ('B', '2', '3.4'),
-              ('D', 4, 12.3))
+              ('D', 4, 12.3),
+              (None, None, None))
     ieq(expect, result)
 
 
@@ -217,10 +217,10 @@ def test_distinct_count():
 
     result = distinct(table, count='count')
     expect = (('foo', 'bar', 'baz', 'count'),
-              (None, None, None, 1),
               ('A', 1, 2, 1),
               ('B', '2', '3.4', 2),
-              ('D', 4, 12.3, 1))
+              ('D', 4, 12.3, 1),
+              (None, None, None, 1))
     ieq(expect, result)
 
 
@@ -242,10 +242,10 @@ def test_key_distinct():
 
     result = distinct(table, key='foo')
     expect = (('foo', 'bar', 'baz'),
-              (None, None, None),
               ('A', 1, 2),
               ('B', '2', '3.4'),
-              ('D', 4, 12.3))
+              ('D', 4, 12.3),
+              (None, None, None))
     ieq(expect, result)
 
 
@@ -260,9 +260,9 @@ def test_key_distinct_2():
 
     result = distinct(tbl, key='b')
     expect = (('a', 'b'),
-              (None, None),
               ('x', '1'),
-              ('x', '3'))
+              ('x', '3'),
+              (None, None))
     ieq(expect, result)
 
 
@@ -277,10 +277,10 @@ def test_key_distinct_count():
 
     result = distinct(table, key='foo', count='count')
     expect = (('foo', 'bar', 'baz', 'count'),
-              (None, None, None, 1),
               ('A', 1, 2, 1),
               ('B', '2', '3.4', 2),
-              ('D', 4, 12.3, 1))
+              ('D', 4, 12.3, 1),
+              (None, None, None, 1))
     ieq(expect, result)
 
 

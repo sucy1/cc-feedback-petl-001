@@ -7,6 +7,30 @@ from functools import partial
 from petl.compat import text_type, binary_type, numeric_types
 
 
+def _is_null_key_value(value):
+    """A key value is treated as null when it is ``None`` or a string that
+    is empty after stripping surrounding whitespace."""
+    if value is None:
+        return True
+    if isinstance(value, text_type):
+        return len(value.strip()) == 0
+    if isinstance(value, binary_type):
+        return len(value.strip()) == 0
+    return False
+
+
+def is_null_key(key):
+    """Return True if a (possibly compound) join key should not participate
+    in matching. ``None`` and empty strings (including whitespace-only
+    strings) are null; for compound keys any null component makes the whole
+    key null."""
+    if isinstance(key, (list, tuple)):
+        if len(key) == 0:
+            return True
+        return any(_is_null_key_value(v) for v in key)
+    return _is_null_key_value(key)
+
+
 class Comparable(object):
     """Wrapper class to allow for flexible comparison of objects of different
     types, preserving the relaxed sorting behaviour of Python 2 with

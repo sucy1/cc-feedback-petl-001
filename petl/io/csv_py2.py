@@ -10,6 +10,8 @@ import cStringIO
 # internal dependencies
 from petl.util.base import Table, data
 from petl.io.base import getcodec
+from petl.io.sources import OpenFileSource
+from petl.errors import ArgumentError
 
 
 def fromcsv_impl(source, **kwargs):
@@ -59,6 +61,14 @@ def appendcsv_impl(table, source, **kwargs):
 
 def _writecsv(table, source, mode, write_header, encoding, errors, **csvargs):
     rows = table if write_header else data(table)
+    if isinstance(source, OpenFileSource):
+        # Python 2 CSV support is byte-oriented; an already-open text stream
+        # cannot be driven through the same encoder path. Pass a path or a
+        # source object implementing open(mode='wb') instead.
+        raise ArgumentError(
+            'writing to an already-open file object is only supported on '
+            'Python 3; on Python 2 pass a file path or an object with an '
+            'open() method returning a binary stream')
     with source.open(mode) as buf:
 
         # determine encoding

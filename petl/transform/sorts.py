@@ -2,17 +2,20 @@ from __future__ import absolute_import, print_function, division
 
 
 import os
+import re
 import heapq
+from decimal import Decimal, InvalidOperation
 from tempfile import NamedTemporaryFile
 import itertools
 import logging
 from collections import namedtuple
+from functools import partial
 import operator
-from petl.compat import pickle, next, text_type
+from petl.compat import pickle, next, text_type, binary_type
 
 
 import petl.config as config
-from petl.comparison import comparable_itemgetter
+from petl.comparison import is_null_key
 from petl.util.base import Table, asindices
 
 
@@ -20,6 +23,199 @@ logger = logging.getLogger(__name__)
 warning = logger.warning
 info = logger.info
 debug = logger.debug
+
+
+# strings that are plain (possibly signed, decimal or exponent notation)
+# numbers, e.g. '010', '-2.5', '1e3'
+_NUMBER_RE = re.compile(r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$')
+
+
+def _parsed_number(value):
+    """Return a Decimal for numeric values and pure-number strings, else
+    None. Floats are converted via their string representation so that
+    Decimal(str(x)) arithmetic is used throughout."""
+    if isinstance(value, bool):
+        # bool is a subclass of int but must not be treated as an amount
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        return Decimal(text_type(value))
+    if isinstance(value, (text_type, binary_type)):
+        if isinstance(value, binary_type):
+            try:
+                value = value.decode('ascii')
+            except UnicodeDecodeError:
+                return None
+        if _NUMBER_RE.match(value.strip()):
+            try:
+                return Decimal(value.strip())
+            except InvalidOperation:
+                return None
+    return None
+
+
+class ReconcileKey(object):
+    """Sort key implementing the reconciliation ordering rules:
+
+    * null values (None and empty/whitespace-only strings) sort last, in
+      both ascending and descending order;
+    * numbers and pure-number strings compare by numeric value;
+    * everything else compares by text code points;
+    * equal keys compare equal so the original row order is preserved.
+
+    The key defines one fixed total order (nulls last). Descending output
+    is obtained by reversing the *non-null* ordering at the output layer
+    while leaving nulls last, see :func:`reconcile_itemgetter`.
+
+    The ordering never raises TypeError.
+    """
+
+    __slots__ = ['obj', 'num']
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.num = _parsed_number(obj)
+
+    # category ranks: null last, then numbers, then everything else
+    def _rank(self):
+        return _rank_of(self.obj, self.num)
+
+    def _cmp(self, other):
+        if isinstance(other, ReconcileKey):
+            other_obj = other.obj
+            other_num = other.num
+        else:
+            other_obj = other
+            other_num = _parsed_number(other)
+        ra, rb = self._rank(), _rank_of(other_obj, other_num)
+        if ra != rb:
+            return -1 if ra < rb else 1
+        if ra == 2:
+            # all nulls are equal, so null rows keep their input order
+            return 0
+        if ra == 0:
+            if self.num == other_num:
+                return 0
+            return -1 if self.num < other_num else 1
+        # text comparison by code point; fall back to type names if the
+        # native comparison fails
+        sa = self.obj if isinstance(self.obj, text_type) \
+            else text_type(self.obj)
+        sb = other_obj if isinstance(other_obj, text_type) \
+            else text_type(other_obj)
+        try:
+            if sa == sb:
+                return 0
+            return -1 if sa < sb else 1
+        except TypeError:
+            ta, tb = type(self.obj).__name__, type(other_obj).__name__
+            if ta == tb:
+                return 0
+            return -1 if ta < tb else 1
+
+    def __lt__(self, other):
+        return self._cmp(other) < 0
+
+    def __eq__(self, other):
+        return self._cmp(other) == 0
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __gt__(self, other):
+        return not (self < other or self == other)
+
+    def __ge__(self, other):
+        return not (self < other)
+
+    def __repr__(self):
+        return 'ReconcileKey(%r)' % (self.obj,)
+
+
+class ReconcileKeyReverse(ReconcileKey):
+    """Descending variant of :class:`ReconcileKey`: non-null values are
+    ordered in reverse, while null values still sort last and stay
+    stable."""
+
+    __slots__ = ()
+
+    def __lt__(self, other):
+        c = self._cmp(other)
+        if c == 0:
+            return False
+        if self._rank() == 2:
+            # a null is never less than anything, so it stays last
+            return False
+        if isinstance(other, ReconcileKey) and other._rank() == 2:
+            # any non-null value precedes a null
+            return True
+        return c > 0
+
+    def __eq__(self, other):
+        return self._cmp(other) == 0
+
+    def __le__(self, other):
+        return self < other or self == other
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __gt__(self, other):
+        # derive strictly from the base relations to keep a total order
+        return not (self < other or self == other)
+
+    def __ge__(self, other):
+        return not (self < other)
+
+
+def _rank_of(obj, num):
+    if is_null_key(obj):
+        return 2
+    if num is not None:
+        return 0
+    return 1
+
+
+def reconcile_itemgetter(*indices, **kwargs):
+    """Item getter returning reconciliation sort keys. A single field index
+    yields a scalar key; multiple indices yield a tuple of keys so compound
+    keys sort lexicographically under the same rules. When `reverse` is
+    True non-null values order descending while nulls remain last."""
+    reverse = kwargs.get('reverse', False)
+    keyclass = ReconcileKeyReverse if reverse else ReconcileKey
+    getter = operator.itemgetter(*indices)
+    getter_with_default = _itemgetter_with_default(*indices)
+
+    def _getter_with_fallback(obj):
+        try:
+            value = getter(obj)
+        except (IndexError, KeyError):
+            value = getter_with_default(obj)
+        if len(indices) == 1:
+            return keyclass(value)
+        return tuple(keyclass(v) for v in value)
+
+    return _getter_with_fallback
+
+
+def _itemgetter_with_default(*args):
+    """itemgetter filling missing values with None instead of raising
+    IndexError or KeyError"""
+    def _get_default(obj, item, default):
+        try:
+            return obj[item]
+        except (IndexError, KeyError):
+            return default
+    if len(args) == 1:
+        return partial(_get_default, item=args[0], default=None)
+    return lambda obj: tuple(_get_default(obj, item=item, default=None)
+                             for item in args)
 
 
 def sort(table, key=None, reverse=False, buffersize=None, tempdir=None,
@@ -285,7 +481,9 @@ class SortView(Table):
         debug('iterate from file cache: %r', filenames)
         yield tuple(self._hdrcache)
         chunkiters = [_iterchunk(fn) for fn in filenames]
-        rows = _mergesorted(self._getkey, self.reverse, *chunkiters)
+        # the cached key already encodes the direction, so merge on its
+        # natural order
+        rows = _mergesorted(self._getkey, False, *chunkiters)
         try:
             for row in rows:
                 yield tuple(row)
@@ -317,14 +515,18 @@ class SortView(Table):
             indices = asindices(hdr, key)
         else:
             indices = range(len(hdr))
-        # now use field indices to construct a _getkey function
-        getkey = comparable_itemgetter(*indices)
+        # now use field indices to construct a _getkey function.
+        # reconciliation ordering: nulls last, numeric-aware comparison,
+        # never raises TypeError. The key itself carries the direction
+        # (nulls stay last when reversed), so rows are sorted without the
+        # built-in reverse flag and merged on the same key order.
+        getkey = reconcile_itemgetter(*indices, reverse=reverse)
 
         # TODO support native comparison
 
         # initialise the first chunk
         rows = list(itertools.islice(it, 0, self.buffersize))
-        rows.sort(key=getkey, reverse=reverse)
+        rows.sort(key=getkey)
 
         # have we exhausted the source iterator?
         if self.buffersize is None or len(rows) < self.buffersize:
@@ -364,7 +566,7 @@ class SortView(Table):
 
                 # grab the next chunk
                 rows = list(itertools.islice(it, 0, self.buffersize))
-                rows.sort(key=getkey, reverse=reverse)
+                rows.sort(key=getkey)
 
             if self._cache:
                 debug('caching files')
@@ -373,7 +575,9 @@ class SortView(Table):
                 self._getkey = getkey
 
             chunkiters = [_iterchunk(f.name) for f in chunkfiles]
-            for row in _mergesorted(getkey, reverse, *chunkiters):
+            # the key already encodes the direction (including nulls-last
+            # under reverse), so always merge ascending on the key order
+            for row in _mergesorted(getkey, False, *chunkiters):
                 yield tuple(row)
 
 
@@ -550,12 +754,13 @@ def itermergesort(sources, key, header, missing, reverse):
     if key is not None:
         # convert field selection into field indices
         indices = asindices(outhdr, key)
-        # now use field indices to construct a _getkey function
-        # N.B., this will probably raise an exception on short rows
-        getkey = comparable_itemgetter(*indices)
+        # reconciliation ordering: nulls last, numeric-aware comparison,
+        # never raises TypeError
+        getkey = reconcile_itemgetter(*indices, reverse=reverse)
 
-    # OK, do the merge sort
-    for row in _shortlistmergesorted(getkey, reverse, *sits):
+    # OK, do the merge sort. The key encodes the direction (nulls stay last
+    # when reversed), so the merge itself is always ascending on key order.
+    for row in _shortlistmergesorted(getkey, False, *sits):
         yield row
 
 
@@ -579,15 +784,15 @@ def issorted(table, key=None, reverse=False, strict=False):
 
     """
 
-    # determine the operator to use when comparing rows
+    # determine the operator to use when comparing whole rows (no key given)
     if reverse and strict:
-        op = operator.lt
-    elif reverse and not strict:
-        op = operator.le
+        row_op = operator.lt
+    elif reverse:
+        row_op = operator.le
     elif strict:
-        op = operator.gt
+        row_op = operator.gt
     else:
-        op = operator.ge
+        row_op = operator.ge
 
     it = iter(table)
     try:
@@ -595,21 +800,26 @@ def issorted(table, key=None, reverse=False, strict=False):
     except StopIteration:
         flds = []
     if key is not None:
-        getkey = comparable_itemgetter(*asindices(flds, key))
+        # use the same reconciliation ordering as sort() so a table produced
+        # by sort() is reported as sorted (nulls last, numeric-aware). The
+        # reverse key already encodes the direction, so the comparison
+        # operators below are the ascending (non-decreasing) ones.
+        getkey = reconcile_itemgetter(*asindices(flds, key), reverse=reverse)
+        key_op = operator.gt if strict else operator.ge
     try:
         prev = next(it)
     except StopIteration:
         return True  # no data rows
     if key is None:
         for curr in it:
-            if not op(curr, prev):
+            if not row_op(curr, prev):
                 return False
             prev = curr
     else:
         prevkey = getkey(prev)
         for curr in it:
             currkey = getkey(curr)
-            if not op(currkey, prevkey):
+            if not key_op(currkey, prevkey):
                 return False
             prevkey = currkey
     return True

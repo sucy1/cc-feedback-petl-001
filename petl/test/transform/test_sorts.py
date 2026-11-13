@@ -79,12 +79,13 @@ def test_sort_3():
              ('D', '10'))
 
     result = sort(table, 'bar')
+    # numeric strings compare by numeric value, so '10' is greater than '9'
     expectation = (('foo', 'bar'),
                    ('F', '1'),
-                   ('D', '10'),
                    ('C', '2'),
                    ('A', '6'),
-                   ('A', '9'))
+                   ('A', '9'),
+                   ('D', '10'))
     ieq(expectation, result)
 
 
@@ -375,12 +376,13 @@ def test_sort_none():
 
     result = sort(table, 'bar')
     print(list(result))
+    # null values sort last under the reconciliation ordering rules
     expectation = (('foo', 'bar'),
-                   ('A', None),
                    ('F', 1),
                    ('C', 2),
                    ('A', 9),
-                   ('D', 10))
+                   ('D', 10),
+                   ('A', None))
     ieq(expectation, result)
 
     dt = datetime.now().replace
@@ -394,11 +396,11 @@ def test_sort_none():
 
     result = sort(table, 'bar')
     expectation = (('foo', 'bar'),
-                   ('A', None),
                    ('A', dt(hour=1)),
                    ('C', dt(hour=5)),
                    ('F', dt(hour=9)),
-                   ('D', dt(hour=17)))
+                   ('D', dt(hour=17)),
+                   ('A', None))
     ieq(expectation, result)
 
 

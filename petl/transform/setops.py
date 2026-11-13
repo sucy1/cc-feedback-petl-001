@@ -2,9 +2,8 @@ from __future__ import absolute_import, print_function, division
 
 from collections import Counter
 from petl.compat import next
-from petl.comparison import Comparable
+from petl.transform.sorts import sort, ReconcileKey
 from petl.util.base import header, Table
-from petl.transform.sorts import sort
 from petl.transform.basics import cut
 
 
@@ -140,9 +139,11 @@ def itercomplement(ta, tb, strict):
             for row in ita:
                 yield row
         else:
-            # we want the elements in a that are not in b
+            # we want the elements in a that are not in b.
+            # rows are sorted under the reconciliation ReconcileKey order,
+            # so compare with the same ordering rather than Comparable
             while True:
-                if b is None or Comparable(a) < Comparable(b):
+                if b is None or ReconcileKey(a) < ReconcileKey(b):
                     yield a
                     try:
                         a = next(ita)
@@ -415,7 +416,8 @@ def iterintersection(a, b):
         a = tuple(next(ita))
         b = tuple(next(itb))
         while True:
-            if Comparable(a) < Comparable(b):
+            # compare under the same ReconcileKey order used by sort()
+            if ReconcileKey(a) < ReconcileKey(b):
                 a = tuple(next(ita))
             elif a == b:
                 yield a

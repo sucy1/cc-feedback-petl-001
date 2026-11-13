@@ -282,7 +282,16 @@ def test_aggregate_multifield_singleton_key(key_type, key_values, form,
     original = list(table)
     key = key_type(['foo'])
     result = _aggregate_multifield(table, key, form, presorted)
-    expected = [('foo', 'total', 'count'), (first, 10, 2), (second, 5, 1)]
+    # null keys (None or empty strings) are ordered by the reconciliation
+    # rules when a sort runs: they sort last. A presorted table is not
+    # re-sorted, so the input order (null first) is preserved.
+    first_is_null = first is None or (
+        isinstance(first, str) and first.strip() == '')
+    if first_is_null and not presorted:
+        expected_groups = [(second, 5, 1), (first, 10, 2)]
+    else:
+        expected_groups = [(first, 10, 2), (second, 5, 1)]
+    expected = [('foo', 'total', 'count')] + expected_groups
 
     assert list(result) == expected
     assert list(result) == expected
@@ -639,9 +648,10 @@ def test_mergeduplicates_field_index_ragged_rows():
              ['s1', 'a'],
              ['f', 0, 'x'],
              ['s2', 'z']]
+    # the short rows have a null (missing) key, so they sort last
     expect = [('baz', 'foo', 'bar'),
-              (None, Conflict(['s1', 's2']), Conflict(['a', 'z'])),
-              ('x', 'f', 0)]
+              ('x', 'f', 0),
+              (None, Conflict(['s1', 's2']), Conflict(['a', 'z']))]
     for key in 'baz', 2, -1:
         ieq(expect, mergeduplicates(table, key))
 
@@ -693,6 +703,8 @@ def test_merge_field_index_reordered_fields():
               (3, 'c')]
     for key in 'id', 0, -2, [0]:
         ieq(expect, merge(table1, table2, key=key))
+        # descending order reverses the non-null groups; there are no null
+        # keys in this table so a plain reversal still holds
         ieq(expect[:1] + expect[:0:-1],
             merge(table1, table2, key=key, reverse=True))
     for key in 2, -3:

@@ -1,8 +1,9 @@
 from __future__ import absolute_import, division, print_function
 
 import itertools
+import operator
 
-from petl.comparison import Comparable, comparable_itemgetter
+from petl.comparison import comparable_itemgetter, is_null_key
 from petl.compat import next, text_type
 from petl.errors import ArgumentError
 from petl.transform.basics import cut, cutout, stack
@@ -54,7 +55,8 @@ def _nonkey_indices(hdr, indices):
 
 
 def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
-         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None):
+         buffersize=None, tempdir=None, cache=True, lprefix=None, rprefix=None,
+         match_nulls=False):
     """
     Perform an equi-join on the given tables. E.g.::
 
@@ -145,13 +147,19 @@ def join(left, right, key=None, lkey=None, rkey=None, presorted=False,
         To ensure correct results for tables with uneven rows, tables will be
         squared up before joining to ensure correct results.
 
+    If `match_nulls` is False (the default), rows with null keys do not
+    participate in matching. ``None`` and empty or whitespace-only strings
+    are treated as null keys. Set `match_nulls` to True to restore the
+    legacy behaviour where null keys on both sides are joined together.
+
     """
 
     # TODO don't read data twice (occurs if using natural key)
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    match_nulls=match_nulls)
 
 
 Table.join = join
@@ -162,7 +170,7 @@ class JoinView(Table):
     def __init__(self, left, right, lkey, rkey,
                  presorted=False, leftouter=False, rightouter=False,
                  missing=None, buffersize=None, tempdir=None, cache=True,
-                 lprefix=None, rprefix=None):
+                 lprefix=None, rprefix=None, match_nulls=False):
         self.lkey = lkey
         self.rkey = rkey
         self.left = stack(left, missing=missing)
@@ -177,17 +185,18 @@ class JoinView(Table):
         self.missing = missing
         self.lprefix = lprefix
         self.rprefix = rprefix
+        self.match_nulls = match_nulls
 
     def __iter__(self):
         return iterjoin(self.left, self.right, self.lkey, self.rkey,
                         leftouter=self.leftouter, rightouter=self.rightouter,
                         missing=self.missing, lprefix=self.lprefix,
-                        rprefix=self.rprefix)
+                        rprefix=self.rprefix, match_nulls=self.match_nulls)
 
 
 def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
              presorted=False, buffersize=None, tempdir=None, cache=True,
-             lprefix=None, rprefix=None):
+             lprefix=None, rprefix=None, match_nulls=False):
     """
     Perform a left outer join on the given tables. E.g.::
 
@@ -232,7 +241,8 @@ def leftjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
     return JoinView(left, right, lkey=lkey, rkey=rkey,
                     presorted=presorted, leftouter=True, rightouter=False,
                     missing=missing, buffersize=buffersize, tempdir=tempdir,
-                    cache=cache, lprefix=lprefix, rprefix=rprefix)
+                    cache=cache, lprefix=lprefix, rprefix=rprefix,
+                    match_nulls=match_nulls)
 
 
 Table.leftjoin = leftjoin
@@ -240,7 +250,7 @@ Table.leftjoin = leftjoin
 
 def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
               presorted=False, buffersize=None, tempdir=None, cache=True,
-              lprefix=None, rprefix=None):
+              lprefix=None, rprefix=None, match_nulls=False):
     """
     Perform a right outer join on the given tables. E.g.::
 
@@ -286,7 +296,7 @@ def rightjoin(left, right, key=None, lkey=None, rkey=None, missing=None,
                     presorted=presorted, leftouter=False, rightouter=True,
                     missing=missing, buffersize=buffersize,
                     tempdir=tempdir, cache=cache, lprefix=lprefix,
-                    rprefix=rprefix)
+                    rprefix=rprefix, match_nulls=match_nulls)
 
 
 Table.rightjoin = rightjoin
@@ -348,7 +358,7 @@ Table.outerjoin = outerjoin
 
 
 def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
-             missing=None, lprefix=None, rprefix=None):
+             missing=None, lprefix=None, rprefix=None, match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -362,6 +372,16 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
     # construct functions to extract key values from both tables
     lgetk = comparable_itemgetter(*lkind)
     rgetk = comparable_itemgetter(*rkind)
+    # raw (unwrapped) key getters matching the key shapes emitted by
+    # groupby: a scalar for a single key, a tuple for compound keys
+    if len(lkind) == 1:
+        lgetkraw = operator.itemgetter(lkind[0])
+    else:
+        lgetkraw = rowgetter(*lkind)
+    if len(rkind) == 1:
+        rgetkraw = operator.itemgetter(rkind[0])
+    else:
+        rgetkraw = rowgetter(*rkind)
 
     # determine indices of non-key fields in the right table
     # (in the output, we only include key fields from the left table - we
@@ -411,61 +431,106 @@ def iterjoin(left, right, lkey, rkey, leftouter=False, rightouter=False,
     # construct group iterators for both tables
     lgit = itertools.groupby(lit, key=lgetk)
     rgit = itertools.groupby(rit, key=rgetk)
-    lrowgrp = []
-    rrowgrp = []
 
-    # loop until *either* of the iterators is exhausted
-    # initialise here to handle empty tables
-    lkval, rkval = Comparable(None), Comparable(None)
-    try:
+    # Streaming merge state (a mutable dict keeps Python 2 compatibility
+    # without nonlocal). Each side has a current group whose first row is
+    # stored (groupby groups are one-shot), a "pending" flag saying whether
+    # that group still needs processing, and an explicit exhaustion marker.
+    state = {'lgrp': None, 'lfirst': None, 'l_pending': False,
+             'rgrp': None, 'rfirst': None, 'r_pending': False,
+             'l_done': False, 'r_done': False}
 
-        # pick off initial row groups
-        lkval, lrowgrp = next(lgit)
-        rkval, rrowgrp = next(rgit)
+    def lgrp_is_null():
+        return not match_nulls and state['lfirst'] is not None \
+            and is_null_key(lgetkraw(state['lfirst']))
 
-        while True:
-            if lkval < rkval:
-                if leftouter:
-                    for row in joinrows(lrowgrp, None):
-                        yield tuple(row)
-                # advance left
-                lkval, lrowgrp = next(lgit)
-            elif lkval > rkval:
-                if rightouter:
-                    for row in joinrows(None, rrowgrp):
-                        yield tuple(row)
-                # advance right
-                rkval, rrowgrp = next(rgit)
-            else:
-                for row in joinrows(lrowgrp, rrowgrp):
+    def rgrp_is_null():
+        return not match_nulls and state['rfirst'] is not None \
+            and is_null_key(rgetkraw(state['rfirst']))
+
+    def l_rows():
+        return itertools.chain([state['lfirst']], state['lgrp'])
+
+    def r_rows():
+        return itertools.chain([state['rfirst']], state['rgrp'])
+
+    def advance_left():
+        state['l_pending'] = False
+        try:
+            kval, grp = next(lgit)
+        except StopIteration:
+            state['l_done'] = True
+            return
+        state['lkval'] = kval
+        state['lgrp'] = grp
+        state['lfirst'] = next(iter(grp))
+        state['l_pending'] = True
+
+    def advance_right():
+        state['r_pending'] = False
+        try:
+            kval, grp = next(rgit)
+        except StopIteration:
+            state['r_done'] = True
+            return
+        state['rkval'] = kval
+        state['rgrp'] = grp
+        state['rfirst'] = next(iter(grp))
+        state['r_pending'] = True
+
+    # pick off initial row groups
+    advance_left()
+    advance_right()
+
+    while state['l_pending'] and state['r_pending']:
+        if lgrp_is_null():
+            # null keys never match; keep left null rows only in a left
+            # (or full) outer join, then move on
+            if leftouter:
+                for row in joinrows(l_rows(), None):
                     yield tuple(row)
-                # advance both
-                lkval, lrowgrp = next(lgit)
-                rkval, rrowgrp = next(rgit)
-
-    except StopIteration:
-        pass
-
-    # make sure any left rows remaining are yielded
-    if leftouter:
-        if lkval > rkval:
-            # yield anything that got left hanging
-            for row in joinrows(lrowgrp, None):
+            advance_left()
+        elif rgrp_is_null():
+            # null keys never match; keep right null rows only in a right
+            # (or full) outer join, then move on
+            if rightouter:
+                for row in joinrows(None, r_rows()):
+                    yield tuple(row)
+            advance_right()
+        elif state['lkval'] < state['rkval']:
+            if leftouter:
+                for row in joinrows(l_rows(), None):
+                    yield tuple(row)
+            advance_left()
+        elif state['lkval'] > state['rkval']:
+            if rightouter:
+                for row in joinrows(None, r_rows()):
+                    yield tuple(row)
+            advance_right()
+        else:
+            for row in joinrows(l_rows(), r_rows()):
                 yield tuple(row)
-        # yield the rest
-        for lkval, lrowgrp in lgit:
-            for row in joinrows(lrowgrp, None):
+            # advance both; each records its own exhaustion, so a group that
+            # was just matched is never left pending on the surviving side
+            advance_left()
+            advance_right()
+
+    # one side is exhausted. The other side's pending group (if any) and all
+    # its remaining groups are unprocessed; emit them under the outer-join
+    # flags. Null groups never matched, so they are emitted like any other
+    # leftover group.
+    if leftouter and state['l_pending']:
+        for row in joinrows(l_rows(), None):
+            yield tuple(row)
+        for _, lgrp2 in lgit:
+            for row in joinrows(lgrp2, None):
                 yield tuple(row)
 
-    # make sure any right rows remaining are yielded
-    if rightouter:
-        if lkval < rkval:
-            # yield anything that got left hanging
-            for row in joinrows(None, rrowgrp):
-                yield tuple(row)
-        # yield the rest
-        for rkval, rrowgrp in rgit:
-            for row in joinrows(None, rrowgrp):
+    if rightouter and state['r_pending']:
+        for row in joinrows(None, r_rows()):
+            yield tuple(row)
+        for _, rgrp2 in rgit:
+            for row in joinrows(None, rgrp2):
                 yield tuple(row)
 
 
@@ -541,7 +606,7 @@ def itercrossjoin(sources, prefix):
 
 
 def antijoin(left, right, key=None, lkey=None, rkey=None, presorted=False,
-             buffersize=None, tempdir=None, cache=True):
+             buffersize=None, tempdir=None, cache=True, match_nulls=False):
     """
     Return rows from the `left` table where the key value does not occur in
     the `right` table. E.g.::
@@ -584,7 +649,8 @@ def antijoin(left, right, key=None, lkey=None, rkey=None, presorted=False,
     lkey, rkey = keys_from_args(left, right, key, lkey, rkey)
     return AntiJoinView(left=left, right=right, lkey=lkey, rkey=rkey,
                         presorted=presorted, buffersize=buffersize,
-                        tempdir=tempdir, cache=cache)
+                        tempdir=tempdir, cache=cache,
+                        match_nulls=match_nulls)
 
 
 Table.antijoin = antijoin
@@ -593,7 +659,8 @@ Table.antijoin = antijoin
 class AntiJoinView(Table):
 
     def __init__(self, left, right, lkey, rkey, presorted=False,
-                 buffersize=None, tempdir=None, cache=True):
+                 buffersize=None, tempdir=None, cache=True,
+                 match_nulls=False):
         if presorted:
             self.left = left
             self.right = right
@@ -604,12 +671,14 @@ class AntiJoinView(Table):
                               tempdir=tempdir, cache=cache)
         self.lkey = lkey
         self.rkey = rkey
+        self.match_nulls = match_nulls
 
     def __iter__(self):
-        return iterantijoin(self.left, self.right, self.lkey, self.rkey)
+        return iterantijoin(self.left, self.right, self.lkey, self.rkey,
+                            match_nulls=self.match_nulls)
 
 
-def iterantijoin(left, right, lkey, rkey):
+def iterantijoin(left, right, lkey, rkey, match_nulls=False):
     lit = iter(left)
     rit = iter(right)
 
@@ -624,45 +693,91 @@ def iterantijoin(left, right, lkey, rkey):
     # construct functions to extract key values from both tables
     lgetk = comparable_itemgetter(*lkind)
     rgetk = comparable_itemgetter(*rkind)
+    if len(lkind) == 1:
+        lgetkraw = operator.itemgetter(lkind[0])
+    else:
+        lgetkraw = rowgetter(*lkind)
+    if len(rkind) == 1:
+        rgetkraw = operator.itemgetter(rkind[0])
+    else:
+        rgetkraw = rowgetter(*rkind)
 
     # construct group iterators for both tables
     lgit = itertools.groupby(lit, key=lgetk)
     rgit = itertools.groupby(rit, key=rgetk)
-    lrowgrp = []
 
-    # loop until *either* of the iterators is exhausted
-    lkval, rkval = Comparable(None), Comparable(None)
-    try:
+    # Streaming merge state (mutable dict for Python 2 compatibility).
+    state = {'lgrp': None, 'lfirst': None, 'l_pending': False,
+             'rgrp': None, 'rfirst': None, 'r_pending': False,
+             'l_done': False, 'r_done': False}
 
-        # pick off initial row groups
-        lkval, lrowgrp = next(lgit)
-        rkval, _ = next(rgit)
+    def lgrp_is_null():
+        return not match_nulls and state['lfirst'] is not None \
+            and is_null_key(lgetkraw(state['lfirst']))
 
-        while True:
-            if lkval < rkval:
-                for row in lrowgrp:
-                    yield tuple(row)
-                # advance left
-                lkval, lrowgrp = next(lgit)
-            elif lkval > rkval:
-                # advance right
-                rkval, _ = next(rgit)
-            else:
-                # advance both
-                lkval, lrowgrp = next(lgit)
-                rkval, _ = next(rgit)
+    def rgrp_is_null():
+        return not match_nulls and state['rfirst'] is not None \
+            and is_null_key(rgetkraw(state['rfirst']))
 
-    except StopIteration:
-        pass
+    def l_rows():
+        return itertools.chain([state['lfirst']], state['lgrp'])
 
-    # any left over?
-    if lkval > rkval:
-        # yield anything that got left hanging
-        for row in lrowgrp:
+    def advance_left():
+        state['l_pending'] = False
+        try:
+            kval, grp = next(lgit)
+        except StopIteration:
+            state['l_done'] = True
+            return
+        state['lkval'] = kval
+        state['lgrp'] = grp
+        state['lfirst'] = next(iter(grp))
+        state['l_pending'] = True
+
+    def advance_right():
+        state['r_pending'] = False
+        try:
+            kval, grp = next(rgit)
+        except StopIteration:
+            state['r_done'] = True
+            return
+        state['rkval'] = kval
+        state['rgrp'] = grp
+        state['rfirst'] = next(iter(grp))
+        state['r_pending'] = True
+
+    # pick off initial row groups
+    advance_left()
+    advance_right()
+
+    while state['l_pending'] and state['r_pending']:
+        if lgrp_is_null():
+            # null keys never match, so the left rows are differences
+            for row in l_rows():
+                yield tuple(row)
+            advance_left()
+        elif rgrp_is_null():
+            # right-side null rows cannot match anything, skip them
+            advance_right()
+        elif state['lkval'] < state['rkval']:
+            for row in l_rows():
+                yield tuple(row)
+            advance_left()
+        elif state['lkval'] > state['rkval']:
+            # advance right
+            advance_right()
+        else:
+            # matching keys: the left rows are not differences, advance both
+            advance_left()
+            advance_right()
+
+    # left groups remaining when (or after) the right side is exhausted are
+    # all differences, including any null-key groups
+    if state['l_pending']:
+        for row in l_rows():
             yield tuple(row)
-    # and the rest...
-    for lkval, lrowgrp in lgit:
-        for row in lrowgrp:
+    for _, lgrp2 in lgit:
+        for row in lgrp2:
             yield tuple(row)
 
 
